@@ -1,1 +1,271 @@
-hello world!
+typedef struct
+{
+    nrf_queue_cb_t * p_cb;          //!< Pointer to the instance control block.
+    void           * p_buffer;      //!< Pointer to the memory that is used as storage.
+    size_t           size;          //!< Size of the queue.
+    size_t           element_size;  //!< Size of one element.
+    nrf_queue_mode_t mode;          //!< Mode of the queue.
+} nrf_queue_t;
+
+typedef struct {
+    uint8_t * p_data;
+    uint8_t length;
+} buffer_t;
+
+typedef struct
+{
+    volatile size_t front;          //!< Queue front index.
+    volatile size_t back;           //!< Queue back index.
+    size_t max_utilization;         //!< Maximum utilization of the queue.
+} nrf_queue_cb_t;
+
+NRF_QUEUE_DEF(buffer_t, m_buf_queue, 20, NRF_QUEUE_MODE_NO_OVERFLOW);//
+#define NRF_QUEUE_DEF(_type, _name, _size, _mode)                             \
+    static _type             CONCAT_2(_name, _nrf_queue_buffer[(_size) + 1]); \
+    static nrf_queue_cb_t    CONCAT_2(_name, _nrf_queue_cb);                  \
+    static const nrf_queue_t _name =                                          \
+        {                                                                     \
+            .p_cb           = &CONCAT_2(_name, _nrf_queue_cb),                \
+            .p_buffer       = CONCAT_2(_name,_nrf_queue_buffer),              \
+            .size           = (_size),                                        \
+            .element_size   = sizeof(_type),                                  \
+            .mode           = _mode,                                          \
+        }
+        
+nrf_queue_push(&m_buf_queue, &buf);
+  ret_code_t nrf_queue_push(nrf_queue_t const * p_queue, void const * p_element)
+{
+    ret_code_t status = NRF_SUCCESS;
+
+    ASSERT(p_queue != NULL);
+    ASSERT(p_element != NULL);
+
+    CRITICAL_REGION_ENTER();
+    bool is_full = nrf_queue_is_full(p_queue);
+    <------------
+    bool nrf_queue_is_full(nrf_queue_t const * p_queue)
+        {
+            ASSERT(p_queue != NULL);
+            size_t front    = p_queue->p_cb->front;
+            size_t back     = p_queue->p_cb->back;
+
+            return (nrf_queue_next_idx(p_queue, back) == front);
+        }
+     __STATIC_INLINE size_t nrf_queue_next_idx(nrf_queue_t const * p_queue, size_t idx)
+        {
+            ASSERT(p_queue != NULL);
+            return (idx < p_queue->size) ? (idx + 1) : 0;
+        }
+  ------------------>
+    if (!is_full || (p_queue->mode == NRF_QUEUE_MODE_OVERFLOW))
+    {
+        // Get write position.
+        size_t write_pos = p_queue->p_cb->back;
+        p_queue->p_cb->back = nrf_queue_next_idx(p_queue, p_queue->p_cb->back);
+        <---------------
+        __STATIC_INLINE size_t nrf_queue_next_idx(nrf_queue_t const * p_queue, size_t idx)
+            {
+                ASSERT(p_queue != NULL);
+                return (idx < p_queue->size) ? (idx + 1) : 0;
+            }
+        ----------------->
+        if (is_full)
+        {
+            // Overwrite the oldest element.
+            p_queue->p_cb->front = nrf_queue_next_idx(p_queue, p_queue->p_cb->front);
+        }
+
+        // Write a new element.
+        switch (p_queue->element_size)
+        {
+            case sizeof(uint8_t):
+                ((uint8_t *)p_queue->p_buffer)[write_pos] = *((uint8_t *)p_element);
+                break;
+
+            case sizeof(uint16_t):
+                ((uint16_t *)p_queue->p_buffer)[write_pos] = *((uint16_t *)p_element);
+                break;
+
+            case sizeof(uint32_t):
+                ((uint32_t *)p_queue->p_buffer)[write_pos] = *((uint32_t *)p_element);
+                break;
+
+            case sizeof(uint64_t):
+                ((uint64_t *)p_queue->p_buffer)[write_pos] = *((uint64_t *)p_element);
+                break;
+
+            default:
+                memcpy((void *)((size_t)p_queue->p_buffer + write_pos * p_queue->element_size),
+                       p_element,
+                       p_queue->element_size);
+                break;
+        }
+
+        // Update utilization.
+        size_t utilization = queue_utilization_get(p_queue);
+        <----------------
+        __STATIC_INLINE size_t queue_utilization_get(nrf_queue_t const * p_queue)
+            {
+                size_t front    = p_queue->p_cb->front;
+                size_t back     = p_queue->p_cb->back;
+                return (back >= front) ? (back - front) : (p_queue->size + 1 - front + back);
+            }
+         ------------------>
+        if (p_queue->p_cb->max_utilization < utilization)
+        {
+            p_queue->p_cb->max_utilization = utilization;
+        }
+    }
+    else
+    {
+        status = NRF_ERROR_NO_MEM;
+    }
+
+    CRITICAL_REGION_EXIT();
+
+    return status;
+}
+
+bool nrf_queue_is_empty(nrf_queue_t const * p_queue)
+{
+    ASSERT(p_queue != NULL);
+    size_t front    = p_queue->p_cb->front;
+    size_t back     = p_queue->p_cb->back;
+    return (front == back);
+}
+
+#define nrf_queue_pop(_p_queue, _p_element) nrf_queue_generic_pop((_p_queue), (_p_element), false)
+
+ret_code_t nrf_queue_generic_pop(nrf_queue_t const * p_queue,
+                                 void              * p_element,
+                                 bool                just_peek)
+{
+    ret_code_t status = NRF_SUCCESS;
+
+    ASSERT(p_queue      != NULL);
+    ASSERT(p_element    != NULL);
+
+    CRITICAL_REGION_ENTER();
+
+    if (!nrf_queue_is_empty(p_queue))
+    {
+        // Get read position.
+        size_t read_pos = p_queue->p_cb->front;
+
+        // Update next read position.
+        if (!just_peek)
+        {
+            p_queue->p_cb->front = nrf_queue_next_idx(p_queue, p_queue->p_cb->front);
+        }
+
+        // Read element.
+        switch (p_queue->element_size)
+        {
+            case sizeof(uint8_t):
+                *((uint8_t *)p_element) = ((uint8_t *)p_queue->p_buffer)[read_pos];
+                break;
+
+            case sizeof(uint16_t):
+                *((uint16_t *)p_element) = ((uint16_t *)p_queue->p_buffer)[read_pos];
+                break;
+
+            case sizeof(uint32_t):
+                *((uint32_t *)p_element) = ((uint32_t *)p_queue->p_buffer)[read_pos];
+                break;
+
+            case sizeof(uint64_t):
+                *((uint64_t *)p_element) = ((uint64_t *)p_queue->p_buffer)[read_pos];
+                break;
+
+            default:
+                memcpy(p_element,
+                       (void const *)((size_t)p_queue->p_buffer + read_pos * p_queue->element_size),
+                       p_queue->element_size);
+                break;
+        }
+    }
+    else
+    {
+        status = NRF_ERROR_NOT_FOUND;
+    }
+
+    CRITICAL_REGION_EXIT();
+
+    return status;
+}
+
+#ifdef SOFTDEVICE_PRESENT
+#define CRITICAL_REGION_ENTER()                                                             \
+    {                                                                                       \
+        uint8_t __CR_NESTED = 0;                                                            \
+        app_util_critical_region_enter(&__CR_NESTED);
+#else
+#define CRITICAL_REGION_ENTER() app_util_critical_region_enter(NULL)
+#endif
+
+void app_util_critical_region_enter(uint8_t *p_nested)
+{
+#if __CORTEX_M == (0x04U)
+    ASSERT(APP_LEVEL_PRIVILEGED == privilege_level_get())
+#endif
+
+#if defined(SOFTDEVICE_PRESENT)
+    /* return value can be safely ignored */
+    (void) sd_nvic_critical_region_enter(p_nested);
+#else
+    app_util_disable_irq();
+#endif
+}
+
+#ifdef SOFTDEVICE_PRESENT
+#define CRITICAL_REGION_EXIT()                                                              \
+        app_util_critical_region_exit(__CR_NESTED);                                         \
+    }
+#else
+#define CRITICAL_REGION_EXIT() app_util_critical_region_exit(0)
+#endif
+
+void app_util_critical_region_exit(uint8_t nested)
+{
+#if __CORTEX_M == (0x04U)
+    ASSERT(APP_LEVEL_PRIVILEGED == privilege_level_get())
+#endif
+
+#if defined(SOFTDEVICE_PRESENT)
+    /* return value can be safely ignored */
+    (void) sd_nvic_critical_region_exit(nested);
+#else
+    app_util_enable_irq();
+#endif
+}
+
+
+void uart_send_data_queue(void)
+{
+	uint32_t err_code;
+
+	static bool need_retry = false;//false:do not need to retry;true: need to retry
+
+    if(need_retry && nus_uart_tx_done){
+        if(nrf_libuarte_async_tx(&libuarte, nus_uart_buf.p_data,nus_uart_buf.length) == NRF_SUCCESS)
+        {
+            need_retry=false;
+            nus_uart_tx_done = false;
+        }
+    }else if(nus_uart_tx_done){
+        if(!nrf_queue_is_empty(&nus_buf_queue))
+		{
+            err_code = nrf_queue_pop(&nus_buf_queue, &nus_uart_buf);
+            APP_ERROR_CHECK(err_code);
+            if(nrf_libuarte_async_tx(&libuarte, nus_uart_buf.p_data,nus_uart_buf.length) == NRF_SUCCESS)
+			{
+                need_retry=false;
+                nus_uart_tx_done = false;
+            }
+			else
+			{
+                need_retry=true;
+            }
+        }
+    }
+}
